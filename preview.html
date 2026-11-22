@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN" data-studymate-demo>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StudyMate · 本地预览</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --line:#e6e8ec; --tx:#15171c; --mut:#6b7280;
+    --ac:#4f46e5; --ac2:#eef0ff;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--tx);
+    font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  .top{
+    height:56px; display:flex; align-items:center; gap:10px; padding:0 24px;
+    background:var(--card); border-bottom:1px solid var(--line);
+  }
+  .dot{width:10px;height:10px;border-radius:3px;background:var(--ac)}
+  .top b{font-size:14px;font-weight:600}
+  .top .tag{
+    font-size:11px;color:var(--ac);background:var(--ac2);
+    padding:2px 8px;border-radius:999px;
+  }
+  .top .sp{flex:1}
+  .top .hint{font-size:12px;color:var(--mut)}
+  .wrap{
+    max-width:1180px;margin:0 auto;padding:24px;
+    display:grid;grid-template-columns:232px 1fr;gap:24px;align-items:start;
+  }
+  @media (min-width:1180px){ .wrap{padding-right:432px} }
+  .side{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .side .course-name{font-weight:600;font-size:13px;margin-bottom:10px}
+  .side ol{margin:0;padding:0;list-style:none}
+  .side li{
+    font-size:12px;color:var(--mut);padding:7px 8px;border-radius:7px;
+    display:flex;gap:8px;align-items:center;
+  }
+  .side li span{width:6px;height:6px;border-radius:50%;background:#d1d5db;flex:none}
+  .side li.done span{background:#0f9d58}
+  .side li.cur{background:var(--ac2);color:var(--ac);font-weight:600}
+  .side li.cur span{background:var(--ac)}
+  .main{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:22px}
+  .crumb{font-size:12px;color:var(--mut);margin-bottom:6px}
+  .chapter-title{font-size:19px;font-weight:600;margin:0 0 14px}
+  .stage{
+    position:relative;aspect-ratio:16/9;border-radius:10px;border:1px solid var(--line);
+    background:
+      linear-gradient(0deg,rgba(79,70,229,.04),rgba(79,70,229,.04)),
+      repeating-linear-gradient(45deg,#fafbfc 0 12px,#f4f5f7 12px 24px);
+    display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;
+    color:var(--mut);font-size:12px;
+  }
+  .stage video{display:block;width:100%;border-radius:10px}
+  .side li{cursor:pointer}
+  .side li:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+  .play{
+    width:52px;height:52px;border-radius:50%;background:var(--card);border:1px solid var(--line);
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 4px 14px rgba(15,23,42,.08);
+  }
+  .play i{
+    width:0;height:0;border-left:14px solid var(--ac);
+    border-top:9px solid transparent;border-bottom:9px solid transparent;margin-left:3px;
+  }
+  .note{margin-top:16px;font-size:12px;color:var(--mut);line-height:1.7}
+  .note b{color:var(--tx);font-weight:600}
+  .kbd{
+    display:inline-block;padding:0 5px;border:1px solid var(--line);border-bottom-width:2px;
+    border-radius:4px;font:11px/16px ui-monospace,Menlo,Consolas,monospace;color:var(--tx);
+    background:#fafbfc;
+  }
+  .card{
+    margin-top:18px;border:1px solid var(--line);border-radius:10px;padding:14px 16px;background:#fcfcfd;
+  }
+  .card h3{margin:0 0 8px;font-size:12px;letter-spacing:.4px;color:var(--mut);font-weight:600}
+  .card ul{margin:0;padding-left:18px;font-size:12.5px;line-height:1.85;color:#374151}
+  .card code{font:12px ui-monospace,Menlo,Consolas,monospace;background:#eef0ff;color:#4338ca;padding:1px 5px;border-radius:4px}
+  @media (prefers-color-scheme: dark){
+    :root{--bg:#101114;--card:#17181c;--line:#2a2d34;--tx:#e8eaee;--mut:#9aa1ac;--ac:#8b87ff;--ac2:#24243a}
+    .stage{background:repeating-linear-gradient(45deg,#191b20 0 12px,#1d2026 12px 24px)}
+    .card{background:#191b20}
+    .card ul{color:#c2c6ce}
+    .kbd{background:#1d2026}
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <span class="dot"></span>
+  <b>课程学习页</b>
+  <span class="tag">本地预览</span>
+  <span class="sp"></span>
+  <span class="hint">预览模式 · 不连接任何平台</span>
+</header>
+
+<div class="wrap">
+  <aside class="side">
+    <div class="course-name">大学物理 · 光学</div>
+    <ol>
+      <li class="done" data-studymate-lesson tabindex="0"><span></span>第 1 章 几何光学</li>
+      <li class="done" data-studymate-lesson tabindex="0"><span></span>第 2 章 光的偏振</li>
+      <li class="cur" data-studymate-lesson aria-current="true" tabindex="0"><span></span>第 3 章 光的干涉</li>
+      <li data-studymate-lesson tabindex="0"><span></span>第 4 章 光的衍射</li>
+      <li data-studymate-lesson tabindex="0"><span></span>第 5 章 光的量子性</li>
+    </ol>
+  </aside>
+
+  <main class="main">
+    <div class="crumb">大学物理 · 光学 / 第 3 章</div>
+    <h1 class="chapter-title">3.2 双缝干涉与条纹间距</h1>
+
+    <div class="stage">
+      <video controls playsinline muted preload="metadata" src="./demo.mp4" aria-label="本地播放演示视频"></video>
+    </div>
+
+    <div class="note">
+      这是 StudyMate 的本地预览页。播放器使用本地 6 秒演示视频，不连接学习平台。
+      开启「播完下一节」可看见左侧章节自动切换；手动暂停或「停止自动」可中断播放。
+      六个页签里的课程、书签和错题是首次打开时生成的示例数据。
+    </div>
+
+    <div class="card">
+      <h3>可以试这些</h3>
+      <ul>
+        <li>在「播放与切换」开启「自动播放」或「播完下一节」，观察播放状态和章节切换</li>
+        <li>点击播放器暂停：脚本会尊重手动暂停；点「播放 / 继续」恢复</li>
+        <li>点「记录本节」：章节名已从页面检出，记录后进度条会变化</li>
+        <li>在「书签」页点「标记当前时间」：记录当前演示视频的时间点</li>
+        <li>在「错题」页点「开始复习」：有一张卡片今天到期，走一遍四档评分</li>
+        <li>在「专注」页点「开始专注」：计时器会走，结束后自动记入今天的分钟数</li>
+        <li>拖动标题栏可以换位置；按 <span class="kbd">Alt</span> + <span class="kbd">M</span> 收起为迷你按钮</li>
+        <li>「进度」页底部可以导出/导入 JSON 备份</li>
+      </ul>
+    </div>
+  </main>
+</div>
+
+<script>
+  document.querySelectorAll('[data-studymate-lesson]').forEach(function (el) {
+    function openLesson() {
+      document.querySelectorAll('[data-studymate-lesson]').forEach(function (row) {
+        row.classList.remove('cur'); row.removeAttribute('aria-current');
+      });
+      el.classList.add('cur'); el.setAttribute('aria-current', 'true');
+      document.querySelector('.chapter-title').textContent = el.textContent.trim();
+      document.querySelector('.crumb').textContent = '大学物理 · 光学 / ' + el.textContent.trim();
+      document.querySelector('video').load();
+    }
+    el.addEventListener('click', openLesson);
+    el.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openLesson(); }
+    });
+  });
+</script>
+<script src="./studymate.user.js"></script>
+</body>
+</html>

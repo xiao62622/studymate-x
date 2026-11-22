@@ -1,0 +1,27 @@
+# Secrets and local configuration
+.env
+.env.*
+*.local
+*.secret
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Logs, caches and local tooling output
+*.log
+.cache/
+.tmp/
+tmp/
+coverage/
+
+# Dependencies and Python caches
+node_modules/
+__pycache__/
+*.py[cod]
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
