@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         StudyMate · 学习助手
 // @namespace    https://local.studymate
-// @version      1.6.7
-// @description  识别课程与视频状态，支持自动播放、播完切换章节及课程；另有进度记录、计划、书签、错题、AI 答题与专注计时。
+// @version      1.7.0
+// @description  识别课程与视频状态，支持获取视频地址、同时播放、自动播放及播完切换章节和课程；另有进度记录、计划、书签、错题、AI 答题与专注计时。
 // @author       local
 // @license      MIT
 // @match        *://*.chaoxing.com/*
@@ -58,7 +58,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.6.7';
+  var VERSION = '1.7.0';
   var KEY = 'studymate:v1';
   var SVGNS = 'http://www.w3.org/2000/svg';
 
@@ -103,7 +103,7 @@
         panel: { right: 16, top: 96, mini: false, tab: 'progress' },
         plan: { chapters: 2, minutes: 60 },
         focus: { work: 25, rest: 5 },
-        playback: { autoPlay: false, autoNext: false, autoCourse: false },
+        playback: { autoPlay: false, autoNext: false, autoCourse: false, parallel: false },
         ai: { provider: 'openai', endpoint: '', apiKey: '', model: 'gpt-4o-mini', temperature: 0.2, maxTokens: 1024 },
         autoAnswer: false,
         autoSubmit: false,
@@ -517,8 +517,8 @@
 
   var videoState = { time: 0, duration: 0, paused: true, ended: false, at: 0 };
   var playback = {
-    reports: [], active: '', attempted: {}, handled: {}, pending: null, command: null,
-    note: '', nextTimer: null, statusWriteAt: 0, contextKey: '', contextAt: Date.now()
+    reports: [], active: '', attempted: {}, handled: {}, pending: null, commands: new Map(),
+    sources: [], note: '', nextTimer: null, statusWriteAt: 0, contextKey: '', contextAt: Date.now()
   };
   var mediaInfo = new WeakMap(), agentId = uid();
 
@@ -713,7 +713,8 @@
       return {
         id: mediaKey(v), time: Number(v.currentTime) || 0, duration: isFinite(v.duration) ? v.duration : 0,
         paused: v.paused, ended: v.ended, rate: Number(v.playbackRate) || 1, ready: v.readyState, error: !!v.error,
-        userPaused: info.userPaused, waiting: info.waiting, visible: isVisible(v)
+        userPaused: info.userPaused, waiting: info.waiting, visible: isVisible(v),
+        src: String(v.currentSrc || v.getAttribute('src') || '')
       };
     });
     var report = { type: 'player-report', media: media, nav: {
@@ -765,10 +766,15 @@
     return out;
   }
 
-  function selectedMedia() {
-    var all = allMedia();
-    return all.find(function (x) { return x.video.id === playback.active; }) ||
-      all.find(function (x) { return !x.video.ended; }) || all[0] || null;
+  function selectedMedia(all) {
+    all = all || allMedia();
+    var active = all.find(function (x) { return x.video.id === playback.active; });
+    if (active && (!playbackSettings().parallel || !active.video.ended)) return active;
+    return all.find(function (x) { return !x.video.ended; }) || active || all[0] || null;
+  }
+
+  function readyForAdvance(targets) {
+    return targets.length && targets.every(function (item) { return item.video.ended && !item.video.userPaused; });
   }
 
   function selectedNavigation() {
@@ -837,7 +843,11 @@
   function sendPlayerCommand(report, action, extra, attempt) {
     var request = uid();
     var data = Object.assign({ __studymate: true, type: 'player-command', request: request, action: action }, extra || {});
-    playback.command = { request: request, source: report.source, at: Date.now(), attempt: attempt };
+    playback.commands.forEach(function (command, key) {
+      if (command.source === report.source && command.id === data.id &&
+          (command.action === 'speed') === (action === 'speed')) playback.commands.delete(key);
+    });
+    playback.commands.set(request, { source: report.source, id: data.id, action: action, at: Date.now(), attempt: attempt });
     if (report.source === window) executePlayerCommand(data);
     else {
       try { report.source.postMessage(data, report.origin === 'null' ? '*' : report.origin); }
@@ -848,52 +858,121 @@
   }
 
   function receivePlayerResult(source, data) {
-    var command = playback.command;
-    if (!command || command.source !== source || command.request !== data.request) return;
-    playback.command = null;
+    var command = playback.commands.get(data.request);
+    if (!command || command.source !== source) return;
+    playback.commands.delete(data.request);
     if (!data.ok) {
-      playback.pending = null;
-      playback.note = String(data.reason || '操作未成功');
+      if (command.action === 'next') playback.pending = null;
+      var reason = String(data.reason || '操作未成功');
       if (data.retryable && command.attempt && command.attempt.count < 3) {
         command.attempt.retryAt = Date.now() + 1500;
-        playback.note = '播放器暂未启动，稍后重试';
-      } else if (command.attempt) {
-        command.attempt.retryAt = Infinity;
+        reason = '播放器暂未启动，稍后重试';
       }
+      if (command.attempt) command.attempt.note = reason;
+      else playback.note = reason;
     }
     paintPlayback();
+  }
+
+  function playerCommandPending(current) {
+    if (!playbackSettings().parallel) return playback.commands.size > 0;
+    return Array.from(playback.commands.values()).some(function (command) {
+      return command.id == null || (command.source === current.report.source && command.id === current.video.id);
+    });
   }
 
   function startAutomaticPlayback(current) {
     var v = current.video;
     var previous = playback.attempted[v.id];
-    if (playback.command || !v.paused || v.ended || v.error || v.userPaused ||
+    if (playerCommandPending(current) || !v.paused || v.ended || v.error || v.userPaused ||
         (previous && Date.now() < previous.retryAt)) return;
-    var attempt = { count: previous ? previous.count + 1 : 1, retryAt: 0 };
+    var attempt = { count: previous ? previous.count + 1 : 1, retryAt: Infinity };
     playback.attempted[v.id] = attempt;
-    playback.note = '';
+    if (!playbackSettings().parallel) playback.note = '';
     sendPlayerCommand(current.report, 'play', { id: v.id, rate: desiredPlaybackRate() }, attempt);
   }
 
   function controlSpeed(rate) {
-    var current = selectedMedia();
+    var all = allMedia(), current = selectedMedia(all);
     if (!current) { playback.note = '未检测到可控制的视频'; paintPlayback(); return false; }
     rate = Number(rate) || 1;
     if (rate < 0.75) rate = 1;
     playback.active = current.video.id;
-    sendPlayerCommand(current.report, 'speed', { id: current.video.id, rate: clamp(rate, 0.75, 4) });
-    playbackSettings().speed = clamp(rate, 0.75, 4); playbackSettings().speedConfigured = true; commit();
+    var speed = clamp(rate, 0.75, 4);
+    var targets = playbackSettings().parallel ? all : [current];
+    targets.forEach(function (item) { sendPlayerCommand(item.report, 'speed', { id: item.video.id, rate: speed }); });
+    playbackSettings().speed = speed; playbackSettings().speedConfigured = true; commit();
     return true;
   }
 
   function controlMedia(action) {
-    var current = selectedMedia();
+    var all = allMedia(), current = selectedMedia(all);
     if (!current) { playback.note = '未检测到可控制的视频，请等待播放器加载'; paintPlayback(); return false; }
     playback.active = current.video.id;
     playback.note = '';
     if (action === 'pause') cancelPlaybackAdvance();
-    sendPlayerCommand(current.report, action, { id: current.video.id, rate: desiredPlaybackRate() });
+    var targets = [current];
+    if (playbackSettings().parallel) {
+      var unfinished = all.filter(function (item) { return !item.video.ended; });
+      targets = unfinished.length ? unfinished : all;
+      if (action === 'play') delete playback.handled[playback.contextKey];
+    }
+    targets.forEach(function (item) {
+      delete playback.attempted[item.video.id];
+      sendPlayerCommand(item.report, action, { id: item.video.id, rate: desiredPlaybackRate() });
+    });
     return true;
+  }
+
+  function sourceValue(item) {
+    var source = item && item.video && item.video.src;
+    return typeof source === 'string' ? source.trim() : '';
+  }
+
+  function collectVideoSources() {
+    var seen = {};
+    playback.sources = allMedia().map(function (item, index) {
+      var src = sourceValue(item);
+      if (!src || seen[src]) return null;
+      seen[src] = true;
+      return { src: src, index: index + 1 };
+    }).filter(Boolean);
+    playback.note = playback.sources.length
+      ? '已找到 ' + playback.sources.length + ' 个页面可访问的视频地址'
+      : '页面没有暴露可复制的视频地址';
+    renderTab();
+  }
+
+  function copyVideoSource(src) {
+    var done = function () { playback.note = '视频地址已复制'; renderTab(); };
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(src).then(done, function () { fallbackCopy(src, done); });
+    } else fallbackCopy(src, done);
+  }
+
+  function fallbackCopy(src, done) {
+    var input = h('textarea', { value: src, style: { position: 'fixed', opacity: '0' } });
+    document.body.appendChild(input); input.select();
+    var copied = false;
+    try { copied = document.execCommand('copy'); } catch (e) { copied = false; }
+    input.remove();
+    if (copied) done();
+    else { playback.note = '复制失败，请手动选择地址'; renderTab(); }
+  }
+
+  function videoSourcesSection() {
+    if (!playback.sources.length) return null;
+    return h('div', { class: 'course', style: { marginTop: '8px' } },
+      h('div', { class: 'course-top' }, h('b', { text: '可访问视频地址' }), h('span', { class: 'mut', text: playback.sources.length + ' 个' })),
+      playback.sources.map(function (item) {
+        return h('div', { class: 'source-row' },
+          h('span', { class: 'source-url', title: item.src, text: item.src }),
+          h('button', { class: 'btn sm', text: '打开', onclick: function () { window.open(item.src, '_blank', 'noopener'); } }),
+          h('button', { class: 'btn sm', text: '复制', onclick: function () { copyVideoSource(item.src); } })
+        );
+      }),
+      h('p', { class: 'tip', text: '这里只读取当前页面已经暴露的地址。blob 或受保护流需要使用页面播放器。' })
+    );
   }
 
   function cancelPlaybackAdvance() {
@@ -941,12 +1020,13 @@
 
   function advancePlayback(automatic) {
     if (playback.pending) return false;
-    var all = allMedia(), current = selectedMedia();
+    var all = allMedia(), current = selectedMedia(all);
     var options = playbackSettings(), nav = selectedNavigation();
     if (automatic) {
       if (!(options.autoPlay || options.autoNext) || !current || !current.video.ended ||
-          playback.command || (nav && nav.nav.kind === 'blocked')) return false;
-      var nextMedia = all.find(function (x) { return !x.video.ended && x.video.id !== current.video.id; });
+          playback.commands.size || (nav && nav.nav.kind === 'blocked')) return false;
+      if (options.parallel && !readyForAdvance(all)) return false;
+      var nextMedia = !options.parallel && all.find(function (x) { return !x.video.ended && x.video.id !== current.video.id; });
       if (nextMedia) {
         playback.active = nextMedia.video.id; playback.note = '';
         startAutomaticPlayback(nextMedia); return true;
@@ -965,11 +1045,27 @@
 
   function paintPlayback() {
     if (!shadow) return;
-    var current = selectedMedia(), v = current && current.video;
+    var all = allMedia(), current = selectedMedia(all), v = current && current.video;
+    var parallel = playbackSettings().parallel;
     var label = !v ? '等待视频' : v.error ? '视频加载失败' : v.ended ? '播放结束' : v.paused ? '已暂停' : v.waiting ? '缓冲中' : '播放中';
     var status = shadow.querySelector('.playback-status'), note = shadow.querySelector('.playback-note');
-    if (status) status.textContent = label + (v ? ' · ' + clock(v.time) + ' / ' + clock(v.duration) : '');
-    if (note) note.textContent = playback.note || '平台会根据实际播放更新进度。手动暂停后不会自动恢复。';
+    if (status) {
+      var summary = label + (v ? ' · ' + clock(v.time) + ' / ' + clock(v.duration) : '');
+      if (parallel && all.length > 1) {
+        var playing = all.filter(function (item) { return !item.video.paused && !item.video.ended && !item.video.waiting; }).length;
+        var ended = all.filter(function (item) { return item.video.ended; }).length;
+        summary = '已识别 ' + all.length + ' 个播放器 · 播放中 ' + playing + ' · 已结束 ' + ended;
+        var failed = all.filter(function (item) { return item.video.error; }).length;
+        if (failed) summary += ' · 加载失败 ' + failed;
+      }
+      if (status.textContent !== summary) status.textContent = summary;
+    }
+    if (note) {
+      var failure = (parallel ? all : current ? [current] : []).map(function (item) {
+        return playback.attempted[item.video.id];
+      }).find(function (attempt) { return attempt && attempt.note; });
+      note.textContent = playback.note || (failure && failure.note) || '平台会根据实际播放更新进度。手动暂停后不会自动恢复。';
+    }
     shadow.querySelectorAll('[data-course-status]').forEach(function (el) {
       var c = state.courses.find(function (item) { return item.id === el.dataset.courseStatus; });
       el.textContent = coursePlaybackText(c);
@@ -983,7 +1079,8 @@
   }
 
   function playbackTick() {
-    var current = selectedMedia(), nav = selectedNavigation();
+    var all = allMedia(), current = selectedMedia(all), nav = selectedNavigation();
+    var options = playbackSettings();
     var contextKey = nav ? nav.nav.key : location.href;
     if (playback.contextKey !== contextKey) {
       playback.contextKey = contextKey; playback.contextAt = Date.now();
@@ -997,14 +1094,18 @@
         }
       }
     }
-    if (playback.command && Date.now() - playback.command.at > 8000) {
-      var command = playback.command;
-      receivePlayerResult(command.source, { request: command.request, ok: false, retryable: true, reason: '播放器未响应，请手动重试' });
-    }
+    playback.commands.forEach(function (command, request) {
+      if (Date.now() - command.at > 8000) {
+        receivePlayerResult(command.source, { request: request, ok: false, retryable: true, reason: '播放器未响应，请手动重试' });
+      }
+    });
     if (playback.pending) {
       var pending = playback.pending;
       var report = livePlayerReports().find(function (r) { return r.source === pending.source; });
-      if ((report && report.nav.key !== pending.key) || (current && current.video.id !== pending.mediaId)) {
+      var mediaChanged = options.parallel ?
+        pending.mediaId && !all.some(function (item) { return item.video.id === pending.mediaId; }) :
+        current && current.video.id !== pending.mediaId;
+      if ((report && report.nav.key !== pending.key) || mediaChanged) {
         playback.pending = null; playback.note = '';
       } else if (Date.now() - pending.at > 10000) {
         playback.pending = null; playback.note = '切换后页面未变化，请处理平台提示后手动重试';
@@ -1014,10 +1115,14 @@
     if (current) {
       var v = current.video;
       playback.active = v.id;
+      var targets = options.parallel ? all : [current];
+      var rate = desiredPlaybackRate();
       // 平台可能在加载后改回默认速率，持续校正到目标速率。
-      if (Math.abs((Number(v.rate) || 1) - desiredPlaybackRate()) > 0.01 && !playback.command) {
-        sendPlayerCommand(current.report, 'speed', { id: v.id, rate: desiredPlaybackRate() });
-      }
+      targets.forEach(function (item) {
+        if (Math.abs((Number(item.video.rate) || 1) - rate) > 0.01 && !playerCommandPending(item)) {
+          sendPlayerCommand(item.report, 'speed', { id: item.video.id, rate: rate });
+        }
+      });
       videoState = { time: v.time, duration: v.duration, paused: v.paused, ended: v.ended, at: Date.now() };
       var course = currentPlatformCourse();
       var status = v.error ? 'error' : v.ended ? 'ended' : v.paused ? 'paused' : 'playing';
@@ -1026,22 +1131,23 @@
         course.playback = { status: status, chapter: chapter, time: v.time, duration: v.duration, at: Date.now() };
         playback.statusWriteAt = Date.now(); rawWrite(JSON.stringify(state));
       }
-      var options = playbackSettings();
       var blocked = nav && nav.nav.kind === 'blocked';
-      if (!blocked && (options.autoPlay || options.autoNext) && v.ended && !v.userPaused &&
-          !playback.handled[v.id] && !playback.nextTimer && !playback.command && Date.now() - playback.contextAt > 1500) {
+      var advanceKey = options.parallel ? contextKey : v.id;
+      if (!blocked && (options.parallel ? options.autoNext : options.autoPlay || options.autoNext) && readyForAdvance(targets) &&
+          !playback.handled[advanceKey] && !playback.nextTimer && !playback.commands.size && Date.now() - playback.contextAt > 1500) {
         // Give the platform's ended handler time to save progress and replace the player.
         var endedContext = contextKey;
         playback.nextTimer = setTimeout(function () {
           playback.nextTimer = null;
-          var latest = selectedMedia(), latestNav = selectedNavigation();
-          if (!latest || latest.video.id !== v.id || !latest.video.ended || latest.video.userPaused ||
-              !latestNav || latestNav.nav.key !== endedContext || playback.command || playback.pending) return;
-          playback.handled[v.id] = true;
+          var latestAll = allMedia(), latest = selectedMedia(latestAll), latestNav = selectedNavigation();
+          if (!latest || (!options.parallel && latest.video.id !== v.id) ||
+              !readyForAdvance(options.parallel ? latestAll : [latest]) ||
+              !latestNav || latestNav.nav.key !== endedContext || playback.commands.size || playback.pending) return;
+          playback.handled[advanceKey] = true;
           advancePlayback(true);
         }, 1500);
       }
-      if (!blocked && options.autoPlay && Date.now() - playback.contextAt > 1500) startAutomaticPlayback(current);
+      if (!blocked && options.autoPlay && Date.now() - playback.contextAt > 1500) targets.forEach(startAutomaticPlayback);
     }
     // A saved autoplay preference also follows an imported course's native first chapter entrance.
     if (!current && playbackSettings().autoPlay && nav && nav.nav.kind === 'next' && pageRole() === 'courseHome' && !playback.handled[nav.nav.key] && Date.now() - playback.contextAt > 1500) {
@@ -1240,6 +1346,8 @@
     '.item-main{flex:1;min-width:0}',
     '.item-main b{display:block;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
     '.item-main span{display:block;font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.source-row{display:flex;gap:6px;align-items:center;padding-top:6px}',
+    '.source-url{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mut);font-size:10px}',
     '.ring{position:relative;display:flex;justify-content:center;padding:6px 0 2px}',
     '.ring-label{position:absolute;inset:6px 0 2px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;pointer-events:none}',
     '.ring-label b{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:.5px}',
@@ -2030,6 +2138,13 @@
         return;
       }
       publishPlayerReport();
+      if (playbackSettings().parallel) {
+        var players = allMedia();
+        if (players.length && !readyForAdvance(players)) {
+          aiState.nextSectionKey = '';
+          return;
+        }
+      }
       if (!advancePlayback(false) && aiState.nextSectionKey === key) aiState.nextSectionKey = '';
     }, 1200);
   }
@@ -2709,11 +2824,12 @@
       h('div', { class: 'row', style: { marginBottom: '8px', flexWrap: 'wrap' } },
         h('button', { class: 'btn pri grow', text: '播放 / 继续', onclick: function () { controlMedia('play'); } }),
         h('button', { class: 'btn grow', text: '暂停', onclick: function () { controlMedia('pause'); } }),
-        h('button', { class: 'btn grow', text: '下一节', onclick: function () { advancePlayback(false); } })
+        h('button', { class: 'btn grow', text: '下一节', onclick: function () { advancePlayback(false); } }),
+        h('button', { class: 'btn grow', text: '获取视频', onclick: collectVideoSources })
       ),
       h('label', { class: 'field', style: { marginTop: '8px' } }, h('span', { text: '播放速度' }), h('select', { onchange: function (e) { controlSpeed(e.target.value); } }, [0.75, 1, 1.25, 1.5, 2, 3, 4].map(function (n) { return h('option', { value: String(n), text: n + '×', selected: n === desiredPlaybackRate() }); })))
     );
-    [['autoPlay', '自动播放'], ['autoNext', '播完下一节'], ['autoCourse', '末节后切换下一门']].forEach(function (item) {
+    [['autoPlay', '自动播放'], ['parallel', '同时播放本页视频'], ['autoNext', '播完下一节'], ['autoCourse', '末节后切换下一门']].forEach(function (item) {
       sec.appendChild(h('label', { class: 'row', style: { padding: '5px 0', cursor: 'pointer', fontSize: '12px' } },
         h('input', { type: 'checkbox', checked: settings[item[0]] === true, style: { width: '16px', height: '16px', margin: '0' },
           onchange: function (e) {
@@ -2725,8 +2841,12 @@
             cancelPlaybackAdvance(); playback.note = '';
             if (e.target.checked) { playback.attempted = {}; playback.handled = {}; }
             commit();
-            var current = selectedMedia();
-            if (settings.autoPlay && e.target.checked && current) startAutomaticPlayback(current);
+            if (settings.autoPlay && e.target.checked) {
+              var nav = selectedNavigation();
+              if (nav && nav.nav.kind === 'blocked') return;
+              var all = allMedia(), current = selectedMedia(all);
+              if (current) (settings.parallel ? all : [current]).forEach(startAutomaticPlayback);
+            }
           }
         }),
         h('span', { text: item[1] })
@@ -2741,6 +2861,8 @@
     ));
     sec.appendChild(h('p', { class: 'tip playback-note', text: playback.note || '平台会根据实际播放更新进度。手动暂停后不会自动恢复。' }));
     sec.appendChild(h('p', { class: 'tip', text: '下一门按已导入课程的顺序打开；启用末节切换会同时开启自动播放和播完下一节。' }));
+    var sources = videoSourcesSection();
+    if (sources) sec.appendChild(sources);
     return sec;
   }
 

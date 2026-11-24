@@ -30,7 +30,13 @@
     max-width:1180px;margin:0 auto;padding:24px;
     display:grid;grid-template-columns:232px 1fr;gap:24px;align-items:start;
   }
+  .main{min-width:0}
   @media (min-width:1180px){ .wrap{padding-right:432px} }
+  @media (max-width:700px){
+    .wrap{display:block;padding:14px}
+    .side{margin-bottom:14px}
+    .main{padding:14px}
+  }
   .side{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
   .side .course-name{font-weight:600;font-size:13px;margin-bottom:10px}
   .side ol{margin:0;padding:0;list-style:none}
@@ -53,7 +59,8 @@
     display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;
     color:var(--mut);font-size:12px;
   }
-  .stage video{display:block;width:100%;border-radius:10px}
+  .stage{flex-direction:row;aspect-ratio:auto}
+  .stage video{display:block;flex:1;width:0;min-width:0;border-radius:10px}
   .side li{cursor:pointer}
   .side li:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
   .play{
@@ -114,7 +121,8 @@
     <h1 class="chapter-title">3.2 双缝干涉与条纹间距</h1>
 
     <div class="stage">
-      <video controls playsinline muted preload="metadata" src="./demo.mp4" aria-label="本地播放演示视频"></video>
+      <video controls playsinline muted preload="metadata" src="./demo.mp4" aria-label="演示视频 1"></video>
+      <video controls playsinline muted preload="metadata" src="./demo.mp4" aria-label="演示视频 2"></video>
     </div>
 
     <div class="note">
@@ -127,6 +135,7 @@
       <h3>可以试这些</h3>
       <ul>
         <li>在「播放与切换」开启「自动播放」或「播完下一节」，观察播放状态和章节切换</li>
+        <li>开启「同时播放本页视频」后，点「播放 / 继续」一起播放两个视频</li>
         <li>点击播放器暂停：脚本会尊重手动暂停；点「播放 / 继续」恢复</li>
         <li>点「记录本节」：章节名已从页面检出，记录后进度条会变化</li>
         <li>在「书签」页点「标记当前时间」：记录当前演示视频的时间点</li>
@@ -148,7 +157,7 @@
       el.classList.add('cur'); el.setAttribute('aria-current', 'true');
       document.querySelector('.chapter-title').textContent = el.textContent.trim();
       document.querySelector('.crumb').textContent = '大学物理 · 光学 / ' + el.textContent.trim();
-      document.querySelector('video').load();
+      document.querySelectorAll('.stage video').forEach(function (video) { video.load(); });
     }
     el.addEventListener('click', openLesson);
     el.addEventListener('keydown', function (event) {

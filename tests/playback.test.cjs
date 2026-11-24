@@ -98,7 +98,7 @@ async function finish(page) {
     await button(page, '播放 / 继续').click(); await page.waitForFunction(() => !document.querySelector('video').paused);
     await button(page, '停止自动').click();
     assert.equal(await page.locator('video').evaluate(v => v.paused), true);
-    assert.deepEqual((await getState(page)).settings.playback, { autoPlay: false, autoNext: false, autoCourse: false });
+    assert.deepEqual((await getState(page)).settings.playback, { autoPlay: false, autoNext: false, autoCourse: false, parallel: false });
     assert.deepEqual(errors, []); await context.close();
   });
   await test('默认 1 倍速且移除 0.5 倍速，AI API 配置可保存', async () => {
@@ -906,6 +906,50 @@ async function finish(page) {
     await page.locator('#v1').evaluate(async v => { v.currentTime = v.duration - 0.12; await v.play(); });
     await page.waitForFunction(() => window.clicks === 1);
     await button(page, '停止自动').click(); await context.close();
+  });
+  await test('本页视频同时自动播放，暂停其中一个时等待它播完才换节', async () => {
+    const html = fixture().replace(media(), media(3).replace('id="v2"', 'id="v2" hidden'));
+    const { context, page, errors } = await setup(html, { parallel: true, autoPlay: true, autoNext: true });
+    await page.waitForFunction(() => ['v0', 'v1'].every(id => document.getElementById(id).currentTime > 0));
+    assert.match(await status(page).innerText(), /已识别 2 个播放器/);
+    assert.equal(await page.locator('#v2').evaluate(v => v.paused), true);
+    await page.locator('#v1').evaluate(v => v.pause());
+    await finish(page);
+    await page.waitForTimeout(2500);
+    assert.equal(await page.evaluate(() => window.clicks), 0);
+    assert.equal(await page.locator('#v1').evaluate(v => v.paused), true);
+    await button(page, '播放 / 继续').click();
+    assert.equal(await page.locator('#v0').evaluate(v => v.ended), true);
+    await page.locator('#v1').evaluate(v => { v.currentTime = v.duration - 0.12; });
+    await page.waitForFunction(() => window.clicks === 1);
+    await button(page, '停止自动').click();
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('video')).every(v => v.paused));
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+  await test('同时播放可以控制两个跨域播放器，并保存选项', async () => {
+    const { context, page, errors } = await setup(fixture({ frames: true }));
+    const players = ['nested.chaoxing.com', 'other.chaoxing.com'].map(host =>
+      page.frames().find(frame => new URL(frame.url()).hostname === host));
+    await checkbox(page, '同时播放本页视频').check();
+    await button(page, '播放 / 继续').click();
+    await Promise.all(players.map(frame => frame.waitForFunction(() => document.querySelector('video').currentTime > 0)));
+    await page.locator('#studymate-host select').first().selectOption('1.5');
+    await Promise.all(players.map(frame => frame.waitForFunction(() => document.querySelector('video').playbackRate === 1.5)));
+    await button(page, '暂停').click();
+    await Promise.all(players.map(frame => frame.waitForFunction(() => document.querySelector('video').paused)));
+    await page.reload();
+    assert.equal(await checkbox(page, '同时播放本页视频').isChecked(), true);
+    assert.deepEqual(errors, []);
+    await context.close();
+  });
+  await test('获取视频显示当前页可访问地址', async () => {
+    const { context, page, errors } = await setup(fixture());
+    await button(page, '获取视频').click();
+    await page.waitForFunction(() => document.querySelector('#studymate-host').shadowRoot.querySelectorAll('.source-row').length === 1);
+    assert.match(await page.locator('#studymate-host .source-url').innerText(), /clip\.mp4/);
+    assert.deepEqual(errors, []);
+    await context.close();
   });
   await test('仅开启自动播放也会接续本页视频，并重试临时起播失败', async () => {
     const { context, page, errors } = await setup(fixture().replace(media(), media(2)), { autoPlay: true });
