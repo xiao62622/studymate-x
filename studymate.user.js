@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StudyMate · 学习助手
 // @namespace    https://local.studymate
-// @version      1.6.6
+// @version      1.6.7
 // @description  识别课程与视频状态，支持自动播放、播完切换章节及课程；另有进度记录、计划、书签、错题、AI 答题与专注计时。
 // @author       local
 // @license      MIT
@@ -58,7 +58,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.6.6';
+  var VERSION = '1.6.7';
   var KEY = 'studymate:v1';
   var SVGNS = 'http://www.w3.org/2000/svg';
 
@@ -1121,17 +1121,6 @@
       if (descendantWindows(window, 0).indexOf(e.source) < 0) return;
       if (d.type === 'player-report') { receivePlayerReport(e.source, e.origin, d); return; }
       if (d.type === 'player-result') { receivePlayerResult(e.source, d); return; }
-      if (d.type === 'answer-next') {
-        setTimeout(function () {
-          var key = navigationInfo().key;
-          if (aiState.nextSectionKey === key) return;
-          aiState.nextSectionKey = key;
-          publishPlayerReport();
-          advancePlayback(false);
-        }, Number(d.delay) || 1200);
-        return;
-      }
-
       if (d.type === 'courses' && Array.isArray(d.items)) {
         var items = d.items.slice(0, 200).filter(function (x) {
           return x && typeof x.name === 'string' && x.name;
@@ -1713,7 +1702,7 @@
     answer: '', testing: false,
     page: '', questions: [], results: new Map(), current: null, scanSignature: '',
     documents: new WeakMap(), submissions: new WeakMap(), videoSubmissions: new Map(),
-    submitStatus: '', countdowns: new WeakMap(), skippedQuizzes: new WeakSet(), nextSectionKey: '',
+    submitStatus: '', countdowns: new WeakMap(), quizResultSections: new WeakMap(), nextSectionKey: '',
     draft: '', image: null, manual: null, imageError: '', capturing: false, reading: false
   };
 
@@ -2000,42 +1989,49 @@
     return null;
   }
 
-  function chapterQuizSubmitted(doc) {
+  function isChapterQuizDocument(doc) {
     if (!doc.defaultView) return false;
     var frame = doc.defaultView.frameElement;
     if (frame && !isVisible(frame)) return false;
     var workPath = /\/(?:api\/work|modules\/work|work\/(?:doHomeWork|view))/i;
     var workFrame = frame && (workPath.test(frame.getAttribute('src') || '') || workPath.test(doc.location.pathname));
-    if (!workFrame && !Array.from(doc.querySelectorAll('.TiMu, .ceyan_name')).some(isVisible)) return false;
-    if (frame && frame.parentElement && frame.parentElement.classList.contains('ans-job-finished')) return true;
-
-    var submitted = /^(?:(?:章节)?测验(?:状态)?\s*[:：]?\s*)?(?:已提交(?:[，,]\s*待批阅)?|提交成功|已完成|待批阅|待批改)[。！!]?$/;
-    return Array.from(doc.querySelectorAll('div, p, span, strong, b, em, h1, h2, h3, h4, [role="status"]')).some(function (element) {
-      var excluded = '.TiMu, nav, .posCatalog_select';
-      return submitted.test(textOf(element)) && !element.closest(excluded) && !element.querySelector(excluded) &&
-        isVisible(element) && submitted.test(element.innerText.trim());
-    }) || (!Array.from(doc.querySelectorAll('[onclick*="btnBlueSubmit"], button, input[type="submit"], input[type="button"], a, [role="button"]')).some(function (element) {
-      return controlEnabled(element) && isVisible(element) &&
-        /^(提交(?:答案|测验)?|确认提交)$/.test(element.matches('input') ? element.value : textOf(element));
-    }) && /(?:已提交|提交成功|已完成|待批阅|待批改)/.test(textOf(doc.documentElement)));
+    return workFrame || Array.from(doc.querySelectorAll('.TiMu, .ceyan_name')).some(isVisible);
   }
 
-  function requestNextSectionAfterSubmit(delay) {
-    var key = navigationInfo().key;
-    if (aiState.nextSectionKey === key) return;
+  function chapterQuizResult(doc) {
+    if (doc.readyState === 'loading' || !isChapterQuizDocument(doc)) return null;
+    var editing = Array.from(doc.querySelectorAll('[onclick*="btnBlueSubmit"], button, input[type="submit"], input[type="button"], a, [role="button"]')).some(function (element) {
+      return (element.matches('[onclick*="btnBlueSubmit"]') ||
+        /^(提交(?:答案|测验)?|确认提交)$/.test(element.matches('input') ? element.value : textOf(element))) && isVisible(element);
+    });
+    if (editing) return null;
+    var submitted = /^(?:(?:章节)?测验(?:状态)?\s*[:：]?\s*)?(?:已提交(?:[，,]\s*待批[阅改])?|提交成功|已完成|待批[阅改])[。！!]?$/;
+    var excluded = '.TiMu, nav, .posCatalog_select, [aria-hidden="true"], [aria-busy="true"]';
+    return Array.from(doc.querySelectorAll('div, p, span, strong, b, em, h1, h2, h3, h4, [role="status"]')).reverse().find(function (element) {
+      return submitted.test(textOf(element)) && !element.closest(excluded) && !element.querySelector(excluded) &&
+        isVisible(element) && submitted.test((element.innerText || '').trim());
+    });
+  }
+
+  function requestNextSectionAfterSubmit(results) {
+    var nav = navigationInfo(), key = nav.key;
+    if (nav.kind !== 'next' || aiState.nextSectionKey === key) return;
+    // A slow chapter switch may leave the previous result visible under the new catalogue entry.
+    results.forEach(function (result) {
+      if (!aiState.quizResultSections.has(result)) aiState.quizResultSections.set(result, key);
+    });
+    if (!results.every(function (result) { return aiState.quizResultSections.get(result) === key; })) return;
     aiState.nextSectionKey = key;
-    if (!IS_TOP) {
-      postToParent({ type: 'answer-next', delay: delay });
-      return;
-    }
     setTimeout(function () {
-      if (navigationInfo().key !== key || (!state.settings.autoAnswer && !state.settings.autoSubmit)) {
+      var quizzes = accessibleDocuments().filter(isChapterQuizDocument).map(chapterQuizResult);
+      if (navigationInfo().key !== key || (!state.settings.autoAnswer && !state.settings.autoSubmit) ||
+          document.hidden || !quizzes.length || !quizzes.every(function (result) { return results.includes(result); })) {
         if (aiState.nextSectionKey === key) aiState.nextSectionKey = '';
         return;
       }
       publishPlayerReport();
-      advancePlayback(false);
-    }, delay);
+      if (!advancePlayback(false) && aiState.nextSectionKey === key) aiState.nextSectionKey = '';
+    }, 1200);
   }
 
   function fillAndSubmit(questions) {
@@ -2050,6 +2046,9 @@
     var previousCountdowns = aiState.countdowns;
     aiState.countdowns = new WeakMap();
     groups.forEach(function (entries, scope) { statuses.push(submitAnsweredGroup(scope, entries, previousCountdowns.get(scope))); });
+    aiState.videoSubmissions.forEach(function (sent) {
+      if (!sent.finished && !groups.has(sent.scope)) statuses.push(checkVideoSubmission(sent));
+    });
     if (statuses.length) aiState.submitStatus = Array.from(new Set(statuses)).join(' · ');
     else if (questions.length) aiState.submitStatus = '当前题目没有可用的自动提交表单。';
     else aiState.submitStatus = '';
@@ -2060,31 +2059,42 @@
     return players.length === 1 ? players[0] : null;
   }
 
-  function checkVideoSubmission(scope, entries, sent) {
-    if (!sent.video || !sent.video.isConnected || sent.video.ended) return sent.status;
-    var video = sent.video;
-    var restarted = infoFor(video).starts !== sent.starts || Math.abs(video.currentTime - sent.time) > 0.25;
-    var submit = submitControl(scope, '#videoquiz-submit');
-    if (sent.reviewing) {
-      // The platform can rewind the video and show the quiz again at the original marker.
-      if (!restarted || !video.paused || !submit || Math.abs(video.currentTime - sent.time) > 2) return sent.status;
-    } else if (restarted) {
+  function checkVideoSubmission(sent, entries) {
+    var scope = sent.scope, video = sent.video;
+    if (sent.finished) return sent.status;
+    if (!video || !video.isConnected || video.ended) {
+      sent.finished = true;
+      return sent.status;
+    }
+    if (!isVisible(video)) return sent.status;
+    if (!video.paused && sent.action !== 'rewind') {
       sent.finished = true;
       return sent.status = '视频已恢复播放。';
     }
-    if (sent.finished || Date.now() < sent.retryAt) return sent.status;
-    if (!submit) {
-      var back = submitControl(scope, '#knowledgeBack');
-      var next = submitControl(scope, '#videoquiz-continue');
-      var wrong = Array.from(scope.querySelectorAll('#spanNot, #spanNotBack, #spanNotBackPoint')).some(isVisible);
-      if (back || next) {
-        sent.reviewing = !!(back || wrong);
-        sent.finished = !sent.reviewing;
-        sent.status = sent.reviewing ? '已按平台提示回看，等待弹题再次出现。' : '已点击继续学习。';
-        (back || next).click();
+    var overlay = sent.overlay;
+    var submit = submitControl(scope, '#videoquiz-submit');
+    if (submitControl(overlay, '#videoquiz-submitting')) return sent.status;
+    if (!sent.action) {
+      var next = submitControl(overlay, '#videoquiz-continue');
+      var back = submitControl(overlay, '#knowledgeBack');
+      if (next || back) {
+        sent.action = next ? 'continue' : 'rewind';
+        sent.starts = infoFor(video).starts;
+        sent.status = next ? '已点击继续学习。' : '已按平台提示回看，等待弹题再次出现。';
+        (next || back).click();
+        return sent.status;
       }
-      return back || next ? sent.status : '视频仍未恢复，等待平台提供重答入口。';
+    } else if (!submit && video.paused && !sent.resumeAttempted && infoFor(video).starts === sent.starts &&
+        !Array.from(overlay.querySelectorAll('.tkItem, #videoquiz-submit, #videoquiz-continue, #knowledgeBack, #spanNot, #spanNotBack, #spanNotBackPoint')).some(isVisible)) {
+      // Some player versions close the quiz or seek back without starting the media again.
+      sent.resumeAttempted = true;
+      Promise.resolve().then(function () { return video.play(); }).catch(function () {
+        sent.status = '视频未能自动恢复，请点击播放器的播放按钮。';
+      });
     }
+    if (!submit) return sent.action || Date.now() < sent.retryAt ? sent.status : '视频仍未恢复，等待平台提供重答入口。';
+    if (!entries || sent.action === 'continue' || !video.paused) return sent.status;
+    if (sent.action !== 'rewind' && Date.now() < sent.retryAt) return sent.status;
     if (sent.answers.length >= 3) return sent.status = '视频仍未恢复，已达到自动重答上限，请查看平台提示。';
     if (!sent.retrying) {
       if (aiState.current || !aiReady(aiConfig())) return '视频仍未恢复，等待重新解答。';
@@ -2107,7 +2117,11 @@
     if (!submissions) { submissions = new Map(); aiState.submissions.set(scope, submissions); }
     var sent = submissions.get(key);
     if (sent) {
-      var status = chapter ? sent.status : checkVideoSubmission(scope, entries, sent);
+      if (!chapter) {
+        sent.scope = scope;
+        sent.overlay = scope.closest('.ans-timelineobjects') || scope;
+      }
+      var status = chapter ? sent.status : checkVideoSubmission(sent, entries);
       if (status && status !== '等待平台提交确认。') return status;
     }
     var started = entries.some(function (entry) { return aiState.results.has(entry[0]); });
@@ -2146,17 +2160,12 @@
       if (confirm) {
         sent.status = '已确认提交，请查看平台结果。';
         confirm.click();
-        requestNextSectionAfterSubmit(1200);
       } else if (sent.functionReady && typeof scope.defaultView.submitCheckTimes === 'function') {
         sent.status = '已确认提交，请查看平台结果。';
-        try {
-          scope.defaultView.submitCheckTimes();
-          requestNextSectionAfterSubmit(1200);
-        }
+        try { scope.defaultView.submitCheckTimes(); }
         catch (error) { sent.status = '平台确认失败，请手动确认。'; }
       } else if (Date.now() >= sent.until) {
-        sent.status = '已点击提交，请查看平台结果。';
-        requestNextSectionAfterSubmit(1200);
+        sent.status = '已点击提交，等待平台显示提交结果。';
         return sent.status;
       }
       else return '等待平台提交确认。';
@@ -2207,9 +2216,12 @@
     if (chapter) submissions.set(key, { status: status, until: Date.now() + 5000 });
     else {
       if (!video) status = '已点击提交，请查看平台结果。';
+      submissions.forEach(function (prior, priorKey) {
+        if (priorKey !== key && prior.scope === scope) prior.finished = true;
+      });
       submissions.set(key, {
-        status: status, retryAt: Date.now() + 15000, video: video,
-        mediaId: mediaId, starts: video && infoFor(video).starts, time: video && video.currentTime,
+        status: status, retryAt: Date.now() + 15000, video: video, scope: scope,
+        overlay: scope.closest('.ans-timelineobjects') || scope,
         answers: (sent ? sent.answers : []).concat([answers])
       });
     }
@@ -2221,15 +2233,15 @@
     var panelOpen = state.settings.panel.tab === 'answer' && !state.settings.panel.mini;
     if (!panelOpen && !state.settings.autoAnswer && !state.settings.autoSubmit) return;
     var page = location.href + '|' + (platform.id === 'cx' ? cxContext().chapterId : '');
-    var questions = [], counts = new Map(), submittedQuizzes = [];
+    var questions = [], counts = new Map(), chapterQuizzes = [];
     var checkSubmission = platform.id === 'cx' && pageRole() === 'study';
     var selector = QUESTION_LAYOUTS.map(function (layout) { return layout.block; }).join(',');
     accessibleDocuments().forEach(function (doc) {
-      if (checkSubmission && chapterQuizSubmitted(doc)) {
-        submittedQuizzes.push(doc);
-        return;
+      if (checkSubmission && isChapterQuizDocument(doc)) {
+        var result = chapterQuizResult(doc);
+        chapterQuizzes.push(result);
+        if (result) return;
       }
-      aiState.skippedQuizzes.delete(doc);
       if (!aiState.documents.has(doc)) aiState.documents.set(doc, uid());
       doc.querySelectorAll(selector).forEach(function (block, index) {
         if (!isVisible(block)) return;
@@ -2260,16 +2272,9 @@
     aiState.questions = questions;
     if (state.settings.autoSubmit && (!document.hidden || state.settings.timedSubmit)) fillAndSubmit(questions);
     else if (!state.settings.autoSubmit) aiState.submitStatus = '';
-    if (submittedQuizzes.length && !questions.length) {
+    if (chapterQuizzes.length && chapterQuizzes.every(Boolean) && !questions.length) {
       aiState.submitStatus = '当前章节测验已提交。';
-      if ((state.settings.autoAnswer || state.settings.autoSubmit) && !document.hidden &&
-          submittedQuizzes.some(function (doc) { return !aiState.skippedQuizzes.has(doc); })) {
-        var nav = selectedNavigation();
-        if (nav && nav.nav.kind !== 'unknown') {
-          submittedQuizzes.forEach(function (doc) { aiState.skippedQuizzes.add(doc); });
-          requestNextSectionAfterSubmit(1200);
-        }
-      }
+      if ((state.settings.autoAnswer || state.settings.autoSubmit) && !document.hidden) requestNextSectionAfterSubmit(chapterQuizzes);
     }
     var signature = JSON.stringify([questions.map(function (entry) { return entry[0]; }), aiState.submitStatus]);
     if (signature !== aiState.scanSignature) { aiState.scanSignature = signature; paintDetectedQuestions(); }
@@ -2294,7 +2299,7 @@
   function answerDetectedQuestion(id, question, manual) {
     var cfg = aiConfig();
     if (aiState.current || question.screenshot || !aiReady(cfg)) return;
-    if (question.scope && question.scope.nodeType === 9 && chapterQuizSubmitted(question.scope)) {
+    if (question.scope && question.scope.nodeType === 9 && chapterQuizResult(question.scope)) {
       scanAnswerPage();
       return;
     }

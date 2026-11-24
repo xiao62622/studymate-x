@@ -364,6 +364,80 @@ async function finish(page) {
     assert.match(await page.evaluate(() => answerRequests[1].messages.at(-1).content), /此前选择：B/);
     assert.deepEqual(errors, []); await context.close();
   });
+  async function verifyVideoQuizFeedback(rewind) {
+    const { context, page, errors } = await setup(fixture().replace(media(), '<iframe src="/same-frame"></iframe>'));
+    const frame = page.frames().find(f => f.url().endsWith('/same-player'));
+    await configureAnswerModel(page, 'openai');
+    await frame.evaluate(async rewind => {
+      document.body.insertAdjacentHTML('beforeend', `
+        <div class="ans-timelineobjects">
+          <div class="ans-videoquiz">
+            <div class="tkTopic_title">判断题</div><div class="tkTopic_con"><div class="tkItem">
+              <div class="tkItem_title">真空中的光速大于声速。</div><ul class="tkItem_ul">
+                <li class="ans-videoquiz-opt"><label><input type="radio" name="quiz" value="A">A、对</label></li>
+                <li class="ans-videoquiz-opt"><label><input type="radio" name="quiz" value="B">B、错</label></li>
+              </ul></div></div><button id="videoquiz-submit">提交</button>
+          </div>
+          <div id="feedback" hidden><p id="spanNot">回答错误</p>
+            ${rewind ? '<button id="knowledgeBack">回看</button>' : '<button id="videoquiz-continue">继续学习</button>'}
+          </div>
+        </div>`);
+      const video = document.querySelector('video');
+      await video.play();
+      video.pause();
+      video.currentTime = 1.5;
+      window.submissions = [];
+      window.continues = 0;
+      const quiz = document.querySelector('.ans-videoquiz');
+      const overlay = quiz.parentElement;
+      document.querySelector('#videoquiz-submit').onclick = () => {
+        const answer = document.querySelector('input:checked').value;
+        submissions.push(answer);
+        quiz.remove();
+        if (answer === 'A') video.play();
+        else document.querySelector('#feedback').hidden = false;
+      };
+      document.querySelector('#feedback button').onclick = () => {
+        continues++;
+        video.currentTime += rewind ? -0.5 : 0.5;
+      };
+      window.showQuizAgain = () => {
+        video.pause();
+        overlay.prepend(quiz);
+      };
+    }, rewind);
+    await page.evaluate(() => {
+      window.GM_xmlhttpRequest = options => {
+        answerRequests.push(JSON.parse(options.data));
+        const answer = answerRequests.length === 1 ? 'B' : 'A';
+        options.onload({ status: 200, responseText: JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ answers: [answer], explanation: '' }) } }]
+        }) });
+      };
+    });
+    await checkbox(page, '自动填充并提交答案').check();
+    await button(page, '解答此题').click();
+    await frame.waitForFunction(() => continues === 1);
+    await frame.waitForTimeout(1100);
+    assert.deepEqual(await frame.evaluate(() => [submissions, continues, document.querySelector('video').paused]), [['B'], 1, true]);
+    const time = await frame.evaluate(() => {
+      document.querySelector('#feedback').hidden = true;
+      return document.querySelector('video').currentTime;
+    });
+    await frame.waitForFunction(time => {
+      const video = document.querySelector('video');
+      return !video.paused && video.currentTime > time + 0.1;
+    }, time);
+    if (rewind) {
+      await frame.evaluate(() => showQuizAgain());
+      await frame.waitForFunction(() => submissions.length === 2 && !document.querySelector('video').paused);
+      assert.deepEqual(await frame.evaluate(() => submissions), ['B', 'A']);
+      assert.match(await page.evaluate(() => answerRequests[1].messages.at(-1).content), /此前选择：B/);
+    }
+    assert.deepEqual(errors, []); await context.close();
+  }
+  await test('视频弹题答错后继续处理已隐藏题干的反馈，并在弹层关闭后续播', () => verifyVideoQuizFeedback(false));
+  await test('视频弹题答错后按平台要求回看，重新弹题时重答', () => verifyVideoQuizFeedback(true));
   await test('嵌套章节测验在最后一题填好后才开始倒计时，归零后提交并确认一次', async () => {
     const { context, page, errors } = await setup(fixture().replace(media(), '<iframe src="/same-frame"></iframe>'));
     const frame = page.frames().find(f => f.url().endsWith('/same-player'));
@@ -479,6 +553,48 @@ async function finish(page) {
     await page.waitForFunction(() => window.clicks === 1);
     assert.equal(await page.evaluate(() => answerRequests.length), 0);
     assert.equal(await page.locator('#curChapterId').inputValue(), 'lesson1');
+    assert.deepEqual(errors, []); await context.close();
+  });
+  await test('章节测验等待迟到的题目和平台提交结果，只切换一次', async () => {
+    const { context, page, errors } = await setup(fixture({ noMedia: true }));
+    await context.route('**/api/work', route => route.fulfill({
+      contentType: 'text/html; charset=utf-8',
+      body: '<div id="quiz"><p>加载题目中</p><p hidden>已完成</p></div>'
+    }));
+    await configureAnswerModel(page, 'openai');
+    await page.evaluate(() => {
+      window.GM_xmlhttpRequest = options => {
+        answerRequests.push(JSON.parse(options.data));
+        options.onload({ status: 200, responseText: JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ answers: ['光速'], explanation: '' }) } }]
+        }) });
+      };
+      document.body.insertAdjacentHTML('beforeend', '<div class="ans-job-finished"><iframe src="/api/work"></iframe></div>');
+    });
+    await page.frameLocator('iframe[src="/api/work"]').locator('#quiz').waitFor();
+    const frame = page.frames().find(item => item.url().endsWith('/api/work'));
+    await checkbox(page, '自动解答检测到的题目').check();
+    await page.waitForTimeout(2300);
+    assert.deepEqual(await page.evaluate(() => [clicks, answerRequests.length]), [0, 0]);
+    await frame.evaluate(() => {
+      const quiz = document.querySelector('#quiz');
+      quiz.innerHTML = '<form><div class="TiMu"><div class="fontLabel">请填写答案</div><textarea></textarea></div><button>提交</button></form>';
+      window.submittedAnswer = '';
+      quiz.querySelector('form').onsubmit = event => {
+        event.preventDefault();
+        submittedAnswer = quiz.querySelector('textarea').value;
+        quiz.innerHTML = '<p class="ceyan_name">章节测验</p><p>正在提交</p>';
+      };
+    });
+    await frame.waitForFunction(() => submittedAnswer === '光速');
+    await page.waitForTimeout(2300);
+    assert.deepEqual(await page.evaluate(() => [clicks, answerRequests.length]), [0, 1]);
+    await frame.evaluate(() => {
+      document.querySelector('#quiz').innerHTML = '<p class="quiz-status">章节测验已提交</p>';
+    });
+    await page.waitForFunction(() => clicks === 1);
+    await page.waitForTimeout(3000);
+    assert.equal(await page.evaluate(() => clicks), 1);
     assert.deepEqual(errors, []); await context.close();
   });
   await test('章节测验遇到无效选项或关掉自动提交时保持待提交', async () => {
