@@ -139,7 +139,7 @@
           playback: Object.assign({}, base.settings.playback, obj(s.playback)),
           ai: Object.assign({}, base.settings.ai, obj(s.ai)),
           autoAnswer: s.autoAnswer === true,
-          autoSubmit: s.autoSubmit === true || s.autoAnswer === true,
+          autoSubmit: s.autoSubmit === true || (s.autoSubmit === undefined && s.autoAnswer === true),
           timedSubmit: s.timedSubmit === true,
           submitDelaySeconds: validSubmitDelay(s.submitDelaySeconds) ? s.submitDelaySeconds : base.settings.submitDelaySeconds,
           shortcuts: s.shortcuts !== false
@@ -155,9 +155,54 @@
   }
 
   var state = IS_TOP ? load() : defaultState();
+  var savedState = JSON.stringify(state);
 
-  function commit() {
-    rawWrite(JSON.stringify(state));
+  function indexRecords(records) {
+    var indexed = new Map(), occurrences = new Map();
+    records.forEach(function (record) {
+      var key = record && record.id != null ? 'id:' + record.id : JSON.stringify(record);
+      var occurrence = occurrences.get(key) || 0;
+      occurrences.set(key, occurrence + 1);
+      indexed.set(key + ':' + occurrence, record);
+    });
+    return indexed;
+  }
+
+  // Merge only this tab's changes against the latest saved data.
+  function mergeState(before, after, latest, field) {
+    if (JSON.stringify(before) === JSON.stringify(after)) return latest;
+    if (field === 'ai' || (field === 'playback' && after && typeof after === 'object' && 'status' in after)) return after;
+    if (Array.isArray(before) && Array.isArray(after) && Array.isArray(latest)) {
+      var previous = indexRecords(before), updates = indexRecords(after), records = indexRecords(latest);
+      previous.forEach(function (record, key) {
+        if (!updates.has(key)) records.delete(key);
+      });
+      updates.forEach(function (record, key) {
+        if (!previous.has(key)) records.set(key, record);
+        else if (records.has(key)) records.set(key, mergeState(previous.get(key), record, records.get(key)));
+      });
+      return Array.from(records.values());
+    }
+    if (before && after && latest && typeof before === 'object' && typeof after === 'object' && typeof latest === 'object' &&
+        !Array.isArray(before) && !Array.isArray(after) && !Array.isArray(latest)) {
+      var merged = {};
+      new Set(Object.keys(latest).concat(Object.keys(after))).forEach(function (key) {
+        if (key !== '__proto__') merged[key] = mergeState(before[key], after[key], latest[key], key);
+      });
+      return merged;
+    }
+    return after;
+  }
+
+  function persistState(replace) {
+    var snapshot = JSON.stringify(state);
+    if (replace) rawWrite(snapshot);
+    else if (snapshot !== savedState) rawWrite(JSON.stringify(mergeState(JSON.parse(savedState), state, load())));
+    savedState = snapshot;
+  }
+
+  function commit(replace) {
+    persistState(replace);
     if (IS_TOP) { renderTab(); renderMini(); }
   }
 
@@ -518,7 +563,7 @@
   var videoState = { time: 0, duration: 0, paused: true, ended: false, at: 0 };
   var playback = {
     reports: [], active: '', attempted: {}, handled: {}, pending: null, commands: new Map(),
-    sources: [], note: '', nextTimer: null, statusWriteAt: 0, contextKey: '', contextAt: Date.now()
+    sources: null, note: '', nextTimer: null, statusWriteAt: 0, contextKey: '', contextAt: Date.now(), parallelAdvanced: false
   };
   var mediaInfo = new WeakMap(), agentId = uid();
 
@@ -746,9 +791,12 @@
     if (IS_TOP && source !== window) {
       try { directlyReadable = !!source.document; } catch (e) { /* Cross-origin */ }
     }
+    var previouslyPlaying = new Set((record.media || []).filter(function (v) {
+      return !v.paused && !v.ended && v.visible;
+    }).map(function (v) { return v.id; }));
     record.media = directlyReadable ? [] : data.media.filter(function (v) { return v && typeof v.id === 'string' && typeof v.time === 'number' && isFinite(v.time); }).slice(0, 20);
-    // A real playing report takes precedence when the user changes the active player.
-    var playing = record.media.find(function (v) { return !v.paused && !v.ended && v.visible; });
+    // Select a player when it starts, while repeated reports leave the current choice alone.
+    var playing = record.media.find(function (v) { return !v.paused && !v.ended && v.visible && !previouslyPlaying.has(v.id); });
     if (playing) playback.active = playing.id;
   }
 
@@ -897,7 +945,6 @@
     if (!current) { playback.note = '未检测到可控制的视频'; paintPlayback(); return false; }
     rate = Number(rate) || 1;
     if (rate < 0.75) rate = 1;
-    playback.active = current.video.id;
     var speed = clamp(rate, 0.75, 4);
     var targets = playbackSettings().parallel ? all : [current];
     targets.forEach(function (item) { sendPlayerCommand(item.report, 'speed', { id: item.video.id, rate: speed }); });
@@ -915,7 +962,7 @@
     if (playbackSettings().parallel) {
       var unfinished = all.filter(function (item) { return !item.video.ended; });
       targets = unfinished.length ? unfinished : all;
-      if (action === 'play') delete playback.handled[playback.contextKey];
+      if (action === 'play') playback.parallelAdvanced = false;
     }
     targets.forEach(function (item) {
       delete playback.attempted[item.video.id];
@@ -924,51 +971,66 @@
     return true;
   }
 
-  function sourceValue(item) {
-    var source = item && item.video && item.video.src;
-    return typeof source === 'string' ? source.trim() : '';
+  function videoSourceUrls(all) {
+    return Array.from(new Set(all.map(function (item) {
+      var source = item.video.src;
+      return typeof source === 'string' ? source.trim() : '';
+    }).filter(Boolean)));
   }
 
   function collectVideoSources() {
-    var seen = {};
-    playback.sources = allMedia().map(function (item, index) {
-      var src = sourceValue(item);
-      if (!src || seen[src]) return null;
-      seen[src] = true;
-      return { src: src, index: index + 1 };
-    }).filter(Boolean);
-    playback.note = playback.sources.length
-      ? '已找到 ' + playback.sources.length + ' 个页面可访问的视频地址'
-      : '页面没有暴露可复制的视频地址';
+    publishPlayerReport();
+    var nav = selectedNavigation(), urls = videoSourceUrls(allMedia());
+    playback.sources = {
+      pageKey: navigationInfo().key, navKey: nav && nav.nav.key, urls: urls,
+      note: urls.length ? '已找到 ' + urls.length + ' 个页面可访问的视频地址' : '页面没有暴露可复制的视频地址'
+    };
+    playback.note = '';
     renderTab();
   }
 
-  function copyVideoSource(src) {
-    var done = function () { playback.note = '视频地址已复制'; renderTab(); };
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      navigator.clipboard.writeText(src).then(done, function () { fallbackCopy(src, done); });
-    } else fallbackCopy(src, done);
+  function refreshVideoSources(all, nav) {
+    var saved = playback.sources;
+    if (!saved || (saved.pageKey === navigationInfo().key && saved.navKey === (nav && nav.nav.key) &&
+        JSON.stringify(saved.urls) === JSON.stringify(videoSourceUrls(all)))) return;
+    playback.sources = null;
+    var section = shadow && shadow.querySelector('.video-sources');
+    if (section) section.remove();
   }
 
-  function fallbackCopy(src, done) {
+  function useVideoSource(snapshot, src, open) {
+    publishPlayerReport();
+    refreshVideoSources(allMedia(), selectedNavigation());
+    if (playback.sources !== snapshot) { paintPlayback(); return; }
+    if (open) { window.open(src, '_blank', 'noopener'); return; }
+    var done = function (copied) {
+      snapshot.note = copied ? '视频地址已复制' : '复制失败，请手动选择地址';
+      paintPlayback();
+    };
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(src).then(function () { done(true); }, function () { done(fallbackCopy(src)); });
+    } else done(fallbackCopy(src));
+  }
+
+  function fallbackCopy(src) {
     var input = h('textarea', { value: src, style: { position: 'fixed', opacity: '0' } });
     document.body.appendChild(input); input.select();
     var copied = false;
     try { copied = document.execCommand('copy'); } catch (e) { copied = false; }
     input.remove();
-    if (copied) done();
-    else { playback.note = '复制失败，请手动选择地址'; renderTab(); }
+    return copied;
   }
 
   function videoSourcesSection() {
-    if (!playback.sources.length) return null;
-    return h('div', { class: 'course', style: { marginTop: '8px' } },
-      h('div', { class: 'course-top' }, h('b', { text: '可访问视频地址' }), h('span', { class: 'mut', text: playback.sources.length + ' 个' })),
-      playback.sources.map(function (item) {
+    var snapshot = playback.sources;
+    if (!snapshot || !snapshot.urls.length) return null;
+    return h('div', { class: 'course video-sources', style: { marginTop: '8px' } },
+      h('div', { class: 'course-top' }, h('b', { text: '可访问视频地址' }), h('span', { class: 'mut', text: snapshot.urls.length + ' 个' })),
+      snapshot.urls.map(function (src) {
         return h('div', { class: 'source-row' },
-          h('span', { class: 'source-url', title: item.src, text: item.src }),
-          h('button', { class: 'btn sm', text: '打开', onclick: function () { window.open(item.src, '_blank', 'noopener'); } }),
-          h('button', { class: 'btn sm', text: '复制', onclick: function () { copyVideoSource(item.src); } })
+          h('span', { class: 'source-url', title: src, text: src }),
+          h('button', { class: 'btn sm', text: '打开', onclick: function () { useVideoSource(snapshot, src, true); } }),
+          h('button', { class: 'btn sm', text: '复制', onclick: function () { useVideoSource(snapshot, src, false); } })
         );
       }),
       h('p', { class: 'tip', text: '这里只读取当前页面已经暴露的地址。blob 或受保护流需要使用页面播放器。' })
@@ -1003,7 +1065,6 @@
     if (!href) { playback.note = '缺少有效课程入口，请回课程列表重新导入'; paintPlayback(); return false; }
     cancelPlaybackAdvance();
     ui.courseId = course.id;
-    rawWrite(JSON.stringify(state));
     try { location.assign(href); }
     catch (e) { playback.note = '课程入口无法打开，请回课程列表重新导入'; paintPlayback(); return false; }
     return true;
@@ -1064,7 +1125,7 @@
       var failure = (parallel ? all : current ? [current] : []).map(function (item) {
         return playback.attempted[item.video.id];
       }).find(function (attempt) { return attempt && attempt.note; });
-      note.textContent = playback.note || (failure && failure.note) || '平台会根据实际播放更新进度。手动暂停后不会自动恢复。';
+      note.textContent = playback.note || (playback.sources && playback.sources.note) || (failure && failure.note) || '平台会根据实际播放更新进度。手动暂停后不会自动恢复。';
     }
     shadow.querySelectorAll('[data-course-status]').forEach(function (el) {
       var c = state.courses.find(function (item) { return item.id === el.dataset.courseStatus; });
@@ -1082,8 +1143,10 @@
     var all = allMedia(), current = selectedMedia(all), nav = selectedNavigation();
     var options = playbackSettings();
     var contextKey = nav ? nav.nav.key : location.href;
+    refreshVideoSources(all, nav);
     if (playback.contextKey !== contextKey) {
       playback.contextKey = contextKey; playback.contextAt = Date.now();
+      playback.parallelAdvanced = false;
       if (nav && nav.nav.title) {
         var focused = shadow && shadow.activeElement;
         if (!focused || !/^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName)) {
@@ -1114,7 +1177,6 @@
     }
     if (current) {
       var v = current.video;
-      playback.active = v.id;
       var targets = options.parallel ? all : [current];
       var rate = desiredPlaybackRate();
       // 平台可能在加载后改回默认速率，持续校正到目标速率。
@@ -1129,12 +1191,12 @@
       var chapter = nav && nav.nav.title || guessChapter();
       if (course && (!course.playback || course.playback.status !== status || course.playback.chapter !== chapter || Date.now() - playback.statusWriteAt > 15000)) {
         course.playback = { status: status, chapter: chapter, time: v.time, duration: v.duration, at: Date.now() };
-        playback.statusWriteAt = Date.now(); rawWrite(JSON.stringify(state));
+        playback.statusWriteAt = Date.now(); persistState();
       }
       var blocked = nav && nav.nav.kind === 'blocked';
-      var advanceKey = options.parallel ? contextKey : v.id;
+      var alreadyAdvanced = options.parallel ? playback.parallelAdvanced : playback.handled[v.id];
       if (!blocked && (options.parallel ? options.autoNext : options.autoPlay || options.autoNext) && readyForAdvance(targets) &&
-          !playback.handled[advanceKey] && !playback.nextTimer && !playback.commands.size && Date.now() - playback.contextAt > 1500) {
+          !alreadyAdvanced && !playback.nextTimer && !playback.commands.size && Date.now() - playback.contextAt > 1500) {
         // Give the platform's ended handler time to save progress and replace the player.
         var endedContext = contextKey;
         playback.nextTimer = setTimeout(function () {
@@ -1143,7 +1205,8 @@
           if (!latest || (!options.parallel && latest.video.id !== v.id) ||
               !readyForAdvance(options.parallel ? latestAll : [latest]) ||
               !latestNav || latestNav.nav.key !== endedContext || playback.commands.size || playback.pending) return;
-          playback.handled[advanceKey] = true;
+          if (options.parallel) playback.parallelAdvanced = true;
+          else playback.handled[v.id] = true;
           advancePlayback(true);
         }, 1500);
       }
@@ -1714,8 +1777,7 @@
   };
 
   function aiConfig() {
-    if (!state.settings.ai || typeof state.settings.ai !== 'object') state.settings.ai = {};
-    var cfg = state.settings.ai;
+    var cfg = Object.assign({}, obj(state.settings.ai));
     if (!AI_PROVIDERS[cfg.provider]) cfg.provider = 'openai';
     var def = AI_PROVIDERS[cfg.provider];
     if (!cfg.endpoint && def.endpoint) cfg.endpoint = def.endpoint;
@@ -2683,7 +2745,7 @@
             return;
           }
           state.settings.submitDelaySeconds = seconds;
-          rawWrite(JSON.stringify(state));
+          persistState();
           scanAnswerPage();
         }
       })),
@@ -2779,6 +2841,7 @@
       cfg.model = model.value.trim();
       cfg.temperature = clamp(Number(temperature.value) || 0, 0, 2);
       cfg.maxTokens = Math.max(1, Math.round(Number(maxTokens.value) || 1024));
+      state.settings.ai = cfg;
       commit();
     }
     [['服务商', provider], ['API 地址', endpoint], ['API Key', key], ['模型', model], ['温度', temperature], ['最大输出 Token', maxTokens]].forEach(function (x) { sec.appendChild(h('label', { class: 'field' }, h('span', { text: x[0] }), x[1])); });
@@ -2839,7 +2902,9 @@
             if (item[0] === 'autoPlay' && !e.target.checked) { settings.autoNext = false; settings.autoCourse = false; }
             if (item[0] === 'autoNext' && !e.target.checked) settings.autoCourse = false;
             cancelPlaybackAdvance(); playback.note = '';
-            if (e.target.checked) { playback.attempted = {}; playback.handled = {}; }
+            if (e.target.checked) {
+              playback.attempted = {}; playback.handled = {}; playback.parallelAdvanced = false;
+            }
             commit();
             if (settings.autoPlay && e.target.checked) {
               var nav = selectedNavigation();
@@ -3025,6 +3090,7 @@
           try {
             var got = JSON.parse(String(reader.result || ''));
             if (!got || !Array.isArray(got.courses)) throw new Error('bad shape');
+            var savedAI = load().settings.ai;
             state = {
               v: 1,
               settings: defaultState().settings,
@@ -3040,11 +3106,16 @@
             ['panel', 'plan', 'focus', 'playback', 'ai'].forEach(function (key) {
               Object.assign(state.settings[key], obj(importedSettings[key]));
             });
+            var importedAI = state.settings.ai;
+            if (!Object.prototype.hasOwnProperty.call(obj(importedSettings.ai), 'apiKey') &&
+                importedAI.provider === savedAI.provider && importedAI.endpoint === savedAI.endpoint) {
+              importedAI.apiKey = savedAI.apiKey;
+            }
             state.settings.shortcuts = importedSettings.shortcuts !== false;
-            cancelPlaybackAdvance(); playback.attempted = {}; playback.handled = {};
+            cancelPlaybackAdvance(); playback.attempted = {}; playback.handled = {}; playback.parallelAdvanced = false;
             ui.courseId = pickCourseId();
             ui.chapter = ui.chapter || guessChapter();
-            commit();
+            commit(true);
             toast('已导入 ' + state.courses.length + ' 门课程');
           } catch (err) {
             toast('导入失败：不是有效的备份文件');
@@ -3061,7 +3132,7 @@
         h('button', { class: 'btn grow', text: '导入备份', onclick: function () { fileInput.click(); } })
       ),
       fileInput,
-      h('p', { class: 'tip', text: '支持实际播放、暂停和课程切换。课程状态由平台按真实学习行为更新；备份包含本地记录和自动播放设置。' })
+      h('p', { class: 'tip', text: '备份包含本地记录和设置。API Key 仅保存在脚本设置中。' })
     );
   }
 
@@ -3197,7 +3268,9 @@
 
   function exportData() {
     try {
-      var blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+      var backup = load();
+      delete backup.settings.ai.apiKey;
+      var blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
       var a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = 'studymate-' + dayKey(Date.now()) + '.json';
@@ -3787,6 +3860,7 @@
     startTopBridge();
     if (DEMO) seedDemo();
     state = load();
+    savedState = JSON.stringify(state);
 
     var tryMount = function () {
       if (!ui.chapter) ui.chapter = guessChapter();

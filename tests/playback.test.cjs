@@ -58,11 +58,16 @@ async function setup(html, options = {}, url = study) {
   }, saved(options));
   await context.route('**/*', async route => {
     const u = new URL(route.request().url());
-    if (u.pathname === '/studymate.user.js') return route.fulfill({ contentType: 'application/javascript; charset=utf-8', body: script });
+    if (u.pathname === '/studymate.user.js') {
+      if (u.searchParams.has('delay-agent')) await new Promise(resolve => setTimeout(resolve, 1900));
+      return route.fulfill({ contentType: 'application/javascript; charset=utf-8', body: script });
+    }
     if (u.pathname === '/clip.mp4') return route.fulfill({ contentType: 'video/mp4', body: clip });
     if (u.pathname === '/frame') {
-      const inner = u.searchParams.has('nested') ? '<iframe src="https://nested.chaoxing.com/frame"></iframe>' : media();
-      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<!doctype html><html><body>${inner}<script src="/studymate.user.js"></script></body></html>` });
+      const delay = u.searchParams.has('delay-nested') ? '?delay-agent' : '';
+      const inner = u.searchParams.has('nested') ? `<iframe src="https://nested.chaoxing.com/frame${delay}"></iframe>` : media();
+      const agent = u.searchParams.has('delay-agent') ? '?delay-agent' : '';
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<!doctype html><html><body>${inner}<script src="/studymate.user.js${agent}"></script></body></html>` });
     }
     if (u.pathname === '/same-frame') return route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<html><body><iframe src="/same-player"></iframe></body></html>' });
     if (u.pathname === '/same-player') return route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<html><body>${media()}</body></html>` });
@@ -823,13 +828,14 @@ async function finish(page) {
     assert.equal(page.url(), nextCourse); assert.match(await note(page).innerText(), /末门/);
     await context.close();
   });
-  await test('跨域嵌套播放器精准控制，不广播播放其他视频', async () => {
-    const { context, page, errors } = await setup(fixture({ frames: true }));
+  await test('跨域嵌套播放器迟到时仍按页面顺序选择播放目标', async () => {
+    const { context, page, errors } = await setup(fixture({ frames: true }).replace('?nested=1', '?nested=1&delay-nested'));
     const nested = page.frames().find(f => new URL(f.url()).hostname === 'nested.chaoxing.com');
     const other = page.frames().find(f => new URL(f.url()).hostname === 'other.chaoxing.com');
     await nested.waitForFunction(() => document.querySelector('video').readyState > 0);
     await page.locator('#studymate-host select').first().selectOption('4');
     await nested.waitForFunction(() => document.querySelector('video').playbackRate === 4);
+    assert.equal(await other.locator('video').evaluate(v => v.playbackRate), 1);
     await nested.evaluate(() => {
       const v = document.querySelector('video');
       Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'playbackRate').set.call(v, 1);
@@ -949,6 +955,84 @@ async function finish(page) {
     await page.waitForFunction(() => document.querySelector('#studymate-host').shadowRoot.querySelectorAll('.source-row').length === 1);
     assert.match(await page.locator('#studymate-host .source-url').innerText(), /clip\.mp4/);
     assert.deepEqual(errors, []);
+    await context.close();
+  });
+  await test('切换章节后清除旧的视频地址并可获取新地址', async () => {
+    const { context, page } = await setup(fixture());
+    await ready(page);
+    const source = page.locator('#studymate-host .source-url');
+    await button(page, '获取视频').click();
+    assert.match(await source.innerText(), /clip\.mp4$/);
+    await page.locator('#lesson1').evaluate(lesson => {
+      lesson.addEventListener('click', () => { document.querySelector('video').src = '/clip.mp4?lesson=2'; });
+    });
+    await button(page, '下一节').click();
+    await source.waitFor({ state: 'detached' });
+    await page.waitForFunction(() => document.querySelector('video').currentSrc.endsWith('?lesson=2'));
+    await button(page, '获取视频').click();
+    assert.match(await source.innerText(), /clip\.mp4\?lesson=2$/);
+    await context.close();
+  });
+  await test('同时播放模式中再次进入同一节，播完后仍切换一次', async () => {
+    const { context, page } = await setup(fixture(), { parallel: true, autoPlay: true, autoNext: true });
+    await finish(page);
+    await page.waitForFunction(() => window.clicks === 1 && !document.querySelector('video').paused);
+    await page.locator('#lesson0').click();
+    await page.waitForFunction(() => !document.querySelector('video').paused);
+    await finish(page);
+    await page.waitForFunction(() => window.clicks === 3);
+    assert.equal(await page.locator('#curChapterId').inputValue(), 'lesson1');
+    await context.close();
+  });
+  await test('旧标签页保存播放进度及其他设置时保留新标签页的改动', async () => {
+    const { context, page } = await setup(fixture());
+    const second = await context.newPage();
+    await second.goto(study);
+    await checkbox(second, '同时播放本页视频').check();
+    await button(second, 'AI API').click();
+    await second.locator('#studymate-host input[placeholder="API Key"]').fill('tab-test-key');
+    await button(second, '保存配置').click();
+    await second.close();
+
+    await button(page, '播放 / 继续').click();
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('studymate:v1')).courses[0].playback?.status === 'playing');
+    await page.locator('#studymate-host select').first().selectOption('1.5');
+    const state = await getState(page);
+    assert.equal(state.settings.playback.parallel, true);
+    assert.equal(state.settings.playback.speed, 1.5);
+    assert.equal(state.settings.ai.apiKey, 'tab-test-key');
+    await context.close();
+  });
+  await test('明确关闭自动提交后刷新，开关保持关闭', async () => {
+    const { context, page } = await setup(fixture({ noMedia: true }));
+    await button(page, '答题').click();
+    await checkbox(page, '自动解答检测到的题目').check();
+    assert.equal(await checkbox(page, '自动填充并提交答案').isChecked(), true);
+    await checkbox(page, '自动填充并提交答案').uncheck();
+    await page.reload();
+    assert.equal(await checkbox(page, '自动解答检测到的题目').isChecked(), true);
+    assert.equal(await checkbox(page, '自动填充并提交答案').isChecked(), false);
+    await context.close();
+  });
+  await test('下载的备份没有 API Key，导回同一接口时保留已保存的密钥', async () => {
+    const { context, page } = await setup(fixture({ noMedia: true }));
+    await button(page, 'AI API').click();
+    await page.locator('#studymate-host input[placeholder="API Key"]').fill('backup-test-key');
+    await button(page, '保存配置').click();
+    await button(page, '进度').click();
+    const pendingDownload = page.waitForEvent('download');
+    await button(page, '导出备份').click();
+    const download = await pendingDownload;
+    const contents = fs.readFileSync(await download.path(), 'utf8');
+    const backup = JSON.parse(contents);
+    assert.equal(Object.hasOwn(backup.settings.ai, 'apiKey'), false);
+    assert.equal(contents.includes('backup-test-key'), false);
+    assert.equal(backup.courses.length, 2);
+
+    const input = page.locator('#studymate-host input[type="file"]');
+    await input.setInputFiles({ name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(contents) });
+    await page.locator('#studymate-host').getByText('已导入 2 门课程', { exact: true }).waitFor();
+    assert.equal((await getState(page)).settings.ai.apiKey, 'backup-test-key');
     await context.close();
   });
   await test('仅开启自动播放也会接续本页视频，并重试临时起播失败', async () => {
